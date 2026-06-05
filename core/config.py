@@ -10,6 +10,26 @@ SELECTORS = {
     "trust": '.kiro-snackbar-actions button[data-variant="secondary"]',
 }
 
+# === Chat selectors ===
+# The chat input is a ProseMirror contenteditable div
+CHAT_INPUT_SELECTOR = '.tiptap.ProseMirror[contenteditable="true"]'
+# Fallback selectors to try for the chat input
+CHAT_INPUT_FALLBACKS = [
+    '[contenteditable="true"].ProseMirror',
+    '.ProseMirror[contenteditable="true"]',
+]
+# The submit button
+CHAT_SUBMIT_SELECTOR = 'button.kiro-button[data-variant="submit"]'
+# The agent's response text (last message from the assistant)
+AGENT_OUTPUT_SELECTOR = '.message-body .markdown-body'
+# Fallback selectors for agent output
+AGENT_OUTPUT_FALLBACKS = [
+    '.assistant-message .markdown-body',
+    '[class*="assistant"] .markdown-body',
+    '.message-content',
+    '[class*="message"] [class*="markdown"]',
+]
+
 CDP_PORT = int(os.environ.get("CDP_PORT", "9229"))
 
 

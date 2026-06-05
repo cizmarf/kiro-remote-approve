@@ -11,6 +11,8 @@ A tool that lets developers approve/reject Kiro IDE agent commands from their ph
 3. When a pending approval is detected (`.kiro-snackbar-container.needs-attention`), it extracts the command from the last `.agent-outcome-details pre` element
 4. Sends a Telegram/Slack message with inline buttons
 5. On user response, clicks the corresponding DOM button via CDP (`data-variant="primary"` for Run, `"tertiary"` for Reject, `"secondary"` for Trust)
+6. Arbitrary text messages are typed into the agent chat via the ProseMirror contenteditable input and submitted by clicking the submit button
+7. When the agent finishes processing, the bot sends back the last lines of the agent's response
 
 ## Key DOM Selectors
 
@@ -19,6 +21,8 @@ A tool that lets developers approve/reject Kiro IDE agent commands from their ph
 - Run button: `.kiro-snackbar-actions button[data-variant="primary"]`
 - Reject button: `.kiro-snackbar-actions button[data-variant="tertiary"]`
 - Trust button: `.kiro-snackbar-actions button[data-variant="secondary"]`
+- Chat input: `.tiptap.ProseMirror[contenteditable="true"]`
+- Submit button: `button.kiro-button[data-variant="submit"]`
 
 ## CDP Target
 

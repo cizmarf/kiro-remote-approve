@@ -77,8 +77,16 @@ python3 telegram-bot/bot.py
 | `n`, `no`, `nope`, `stop` | Reject |
 | `t`, `trust`, `always` | Trust (always approve) |
 | `/buttons` | Show inline button keyboard |
-| `/status` | Check Kiro connection |
+| `/status` | Check Kiro connection + agent status |
+| `/output` | Get last agent output |
 | `/help` | Show help |
+| *(any other text)* | Send directly to agent chat |
+
+#### Direct Agent Communication
+
+Any message that isn't a recognized command gets sent directly to the Kiro agent's chat input. This lets you interact with the agent from your phone — ask questions, give instructions, etc.
+
+When the agent finishes processing your message, the bot automatically sends you the last ~15 lines of the agent's response.
 
 ---
 

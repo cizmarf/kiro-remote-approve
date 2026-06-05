@@ -26,7 +26,10 @@ import urllib.error
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core.config import load_env, SELECTORS
-from core.cdp import do_click, get_ws_url, check_pending_approval
+from core.cdp import (
+    do_click, get_ws_url, check_pending_approval,
+    send_message_to_agent, get_agent_output, is_agent_busy,
+)
 
 # Load environment
 load_env()
@@ -39,6 +42,8 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 last_update_id = 0
 running = True
 last_notified_command = None
+waiting_for_agent = False  # True when we sent a message and await response
+agent_was_busy = False     # Track agent busy state for finish detection
 
 
 # === Telegram API ===
@@ -97,13 +102,16 @@ def handle_callback(callback_query):
 
 
 def handle_message(message):
-    text = message.get("text", "").strip().lower()
+    global waiting_for_agent, agent_was_busy
+
+    text = message.get("text", "").strip()
+    text_lower = text.lower()
     from_user = str(message.get("from", {}).get("id", ""))
 
     if from_user != str(CHAT_ID):
         return
 
-    if text in ("/start", "/help"):
+    if text_lower in ("/start", "/help"):
         send_message(
             "🤖 <b>Kiro Remote Approve</b>\n\n"
             "Commands:\n"
@@ -111,18 +119,20 @@ def handle_message(message):
             "  <b>n</b> / <b>no</b> → Reject\n"
             "  <b>t</b> / <b>trust</b> → Trust (always approve)\n"
             "  /buttons → Show buttons\n"
-            "  /status → Check Kiro connection"
+            "  /status → Check Kiro connection\n"
+            "  /output → Get last agent output\n\n"
+            "Any other text → sent directly to agent chat"
         )
-    elif text in ("y", "yes", "ok", "go", "/approve", "run"):
+    elif text_lower in ("y", "yes", "ok", "go", "/approve", "run"):
         result = do_click("approve")
         send_message(result)
-    elif text in ("n", "no", "nope", "stop", "/reject"):
+    elif text_lower in ("n", "no", "nope", "stop", "/reject"):
         result = do_click("reject")
         send_message(result)
-    elif text in ("t", "trust", "always", "/trust"):
+    elif text_lower in ("t", "trust", "always", "/trust"):
         result = do_click("trust")
         send_message(result)
-    elif text == "/buttons":
+    elif text_lower == "/buttons":
         send_message("🤖 <b>Approve?</b>", reply_markup={
             "inline_keyboard": [[
                 {"text": "✅ Run", "callback_data": "approve"},
@@ -130,18 +140,63 @@ def handle_message(message):
                 {"text": "🔄 Trust", "callback_data": "trust"},
             ]]
         })
-    elif text == "/status":
+    elif text_lower == "/status":
         ws = get_ws_url()
         if ws:
-            send_message("🟢 <b>Kiro is connected</b>")
+            busy = is_agent_busy()
+            status = "🟡 Agent is working..." if busy else "🟢 Agent idle"
+            send_message(f"🟢 <b>Kiro is connected</b>\n{status}")
         else:
             send_message(
                 "🔴 <b>Cannot reach Kiro</b>\n\n"
                 "Make sure it's running with "
                 "--remote-debugging-port=9229"
             )
+    elif text_lower == "/output":
+        output = get_agent_output(max_lines=15)
+        if output:
+            # Truncate if too long for Telegram (4096 char limit)
+            if len(output) > 3500:
+                output = output[-3500:]
+            send_message(f"🤖 <b>Last agent output:</b>\n\n<pre>{output}</pre>")
+        else:
+            send_message("⚠️ No agent output found")
     else:
-        send_message("❓ Send <b>y</b>, <b>n</b>, <b>t</b>, or /help")
+        # Send any other text directly to the agent
+        result = send_message_to_agent(text)
+        send_message(result)
+        if "Sent" in result:
+            waiting_for_agent = True
+            agent_was_busy = False
+
+
+# === Agent Completion Watcher ===
+def poll_agent_completion():
+    """Watch for agent to finish after we sent a message."""
+    global waiting_for_agent, agent_was_busy
+
+    if not waiting_for_agent:
+        return
+
+    busy = is_agent_busy()
+
+    if busy:
+        agent_was_busy = True
+    elif agent_was_busy and not busy:
+        # Agent was busy and now stopped — it finished
+        waiting_for_agent = False
+        agent_was_busy = False
+        # Give it a moment for final render
+        time.sleep(1)
+        output = get_agent_output(max_lines=15)
+        if output:
+            if len(output) > 3500:
+                output = output[-3500:]
+            send_message(
+                f"✅ <b>Agent finished:</b>\n\n<pre>{output}</pre>"
+            )
+        else:
+            send_message("✅ Agent finished (no output captured)")
 
 
 # === Approval Watcher ===
@@ -216,6 +271,7 @@ def main():
         try:
             poll_updates()
             poll_for_approvals()
+            poll_agent_completion()
         except KeyboardInterrupt:
             break
         except Exception as e:
