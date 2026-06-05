@@ -1,1 +1,2 @@
 websockets>=12.0
+slack_bolt>=1.18.0

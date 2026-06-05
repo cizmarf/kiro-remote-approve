@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Kiro Remote Approve - Telegram Bot via CDP
+Kiro Remote Approve - Telegram Bot
 
 Approve/reject Kiro agent commands from your phone via Telegram.
-Requires Kiro launched with: --remote-debugging-port=9229
+Uses shared CDP core for button clicking.
 
 Usage:
-  python3 bot.py
+  python3 telegram-bot/bot.py
 
-Environment variables (or edit below):
+Environment variables:
   TELEGRAM_BOT_TOKEN  - Bot token from @BotFather
   TELEGRAM_CHAT_ID    - Your chat ID from @userinfobot
+  CDP_PORT            - Kiro debug port (default: 9229)
 """
 
 import os
@@ -18,36 +19,26 @@ import sys
 import json
 import time
 import signal
-import asyncio
 import urllib.request
 import urllib.error
-from pathlib import Path
 
-# === Load .env if present ===
-env_file = Path(__file__).resolve().parent.parent / ".env"
-if env_file.exists():
-    for line in env_file.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            key, _, value = line.partition("=")
-            os.environ.setdefault(key.strip(), value.strip())
+# Add project root to path
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from core.config import load_env, SELECTORS
+from core.cdp import do_click, get_ws_url, check_pending_approval
+
+# Load environment
+load_env()
 
 # === Configuration ===
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-CDP_PORT = int(os.environ.get("CDP_PORT", "9229"))
 
 # === State ===
 last_update_id = 0
 running = True
-last_notified_command = None  # Track to avoid duplicate notifications
-
-# === Button selectors ===
-SELECTORS = {
-    "approve": '.kiro-snackbar-actions button[data-variant="primary"]',
-    "reject": '.kiro-snackbar-actions button[data-variant="tertiary"]',
-    "trust": '.kiro-snackbar-actions button[data-variant="secondary"]',
-}
+last_notified_command = None
 
 
 # === Telegram API ===
@@ -55,7 +46,10 @@ def telegram_api(method, data=None):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     if data:
         payload = json.dumps(data).encode("utf-8")
-        req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+        req = urllib.request.Request(
+            url, data=payload,
+            headers={"Content-Type": "application/json"}
+        )
     else:
         req = urllib.request.Request(url)
     try:
@@ -72,78 +66,6 @@ def send_message(text, reply_markup=None):
     return telegram_api("sendMessage", data)
 
 
-# === CDP Click Logic ===
-def get_ws_url():
-    """Find the kiroAgent webview iframe."""
-    data = urllib.request.urlopen(f"http://127.0.0.1:{CDP_PORT}/json").read()
-    pages = json.loads(data)
-    for p in pages:
-        url = p.get("url", "")
-        if p.get("type") == "iframe" and "kiroAgent" in url:
-            return p["webSocketDebuggerUrl"]
-    for p in pages:
-        if p.get("type") == "iframe":
-            return p["webSocketDebuggerUrl"]
-    return None
-
-
-async def cdp_click(action):
-    """Click a Kiro approval button via CDP WebSocket."""
-    try:
-        import websockets
-    except ImportError:
-        import subprocess
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "websockets", "-q"])
-        import websockets
-
-    ws_url = get_ws_url()
-    if not ws_url:
-        return "ERROR: Cannot find Kiro webview (is Kiro running with --remote-debugging-port=9229?)"
-
-    selector = SELECTORS[action]
-    js = f"""
-    (function() {{
-        const btn = document.querySelector('{selector}');
-        if (btn) {{ btn.click(); return 'CLICKED'; }}
-        const iframes = document.querySelectorAll('iframe');
-        for (let i = 0; i < iframes.length; i++) {{
-            try {{
-                const doc = iframes[i].contentDocument;
-                if (doc) {{
-                    const innerBtn = doc.querySelector('{selector}');
-                    if (innerBtn) {{ innerBtn.click(); return 'CLICKED_IFRAME'; }}
-                }}
-            }} catch(e) {{}}
-        }}
-        return 'NO_BUTTON';
-    }})()
-    """
-
-    try:
-        async with websockets.connect(ws_url) as ws:
-            msg = json.dumps({
-                "id": 1,
-                "method": "Runtime.evaluate",
-                "params": {"expression": js, "returnByValue": True}
-            })
-            await ws.send(msg)
-            resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
-            result = resp.get("result", {}).get("result", {}).get("value", "UNKNOWN")
-            if "CLICKED" in result:
-                return f"✅ {action.capitalize()}d"
-            elif result == "NO_BUTTON":
-                return "⚠️ No pending approval found"
-            else:
-                return f"❓ {result}"
-    except Exception as e:
-        return f"❌ CDP error: {e}"
-
-
-def do_click(action):
-    """Synchronous wrapper for CDP click."""
-    return asyncio.run(cdp_click(action))
-
-
 # === Message Handlers ===
 def handle_callback(callback_query):
     data = callback_query.get("data", "")
@@ -151,12 +73,19 @@ def handle_callback(callback_query):
     from_user = str(callback_query.get("from", {}).get("id", ""))
 
     if from_user != str(CHAT_ID):
-        telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": "⛔ Unauthorized", "show_alert": True})
+        telegram_api("answerCallbackQuery", {
+            "callback_query_id": callback_id,
+            "text": "⛔ Unauthorized",
+            "show_alert": True,
+        })
         return
 
     if data in SELECTORS:
         result = do_click(data)
-        telegram_api("answerCallbackQuery", {"callback_query_id": callback_id, "text": result})
+        telegram_api("answerCallbackQuery", {
+            "callback_query_id": callback_id,
+            "text": result,
+        })
         message = callback_query.get("message", {})
         if message.get("message_id"):
             telegram_api("editMessageText", {
@@ -195,104 +124,47 @@ def handle_message(message):
         send_message(result)
     elif text == "/buttons":
         send_message("🤖 <b>Approve?</b>", reply_markup={
-            "inline_keyboard": [
-                [
-                    {"text": "✅ Run", "callback_data": "approve"},
-                    {"text": "❌ Reject", "callback_data": "reject"},
-                    {"text": "🔄 Trust", "callback_data": "trust"},
-                ]
-            ]
+            "inline_keyboard": [[
+                {"text": "✅ Run", "callback_data": "approve"},
+                {"text": "❌ Reject", "callback_data": "reject"},
+                {"text": "🔄 Trust", "callback_data": "trust"},
+            ]]
         })
     elif text == "/status":
         ws = get_ws_url()
         if ws:
             send_message("🟢 <b>Kiro is connected</b>")
         else:
-            send_message("🔴 <b>Cannot reach Kiro</b>\n\nMake sure it's running with --remote-debugging-port=9229")
+            send_message(
+                "🔴 <b>Cannot reach Kiro</b>\n\n"
+                "Make sure it's running with "
+                "--remote-debugging-port=9229"
+            )
     else:
         send_message("❓ Send <b>y</b>, <b>n</b>, <b>t</b>, or /help")
 
 
 # === Approval Watcher ===
-def check_pending_approval():
-    """Poll Kiro via CDP to detect pending approval and extract the command."""
+def poll_for_approvals():
+    """Check for pending approvals and notify."""
     global last_notified_command
 
-    ws_url = get_ws_url()
-    if not ws_url:
-        return
-
-    js = """
-    (function() {
-        // Check if snackbar with "Waiting on your input" is visible
-        const snackbar = document.querySelector('.kiro-snackbar-container.needs-attention');
-        if (!snackbar) {
-            // Also check inside iframes
-            const iframes = document.querySelectorAll('iframe');
-            for (let i = 0; i < iframes.length; i++) {
-                try {
-                    const doc = iframes[i].contentDocument;
-                    if (doc) {
-                        const sb = doc.querySelector('.kiro-snackbar-container.needs-attention');
-                        if (sb) {
-                            const cmds = doc.querySelectorAll('.agent-outcome-details pre');
-                            const cmd = cmds.length > 0 ? cmds[cmds.length - 1] : null;
-                            return cmd ? cmd.textContent : 'PENDING_NO_CMD';
-                        }
-                    }
-                } catch(e) {}
+    result = check_pending_approval()
+    if result and result != "null" and result != last_notified_command:
+        last_notified_command = result
+        cmd_text = result if result != "PENDING_NO_CMD" else "(unknown command)"
+        send_message(
+            f"🔔 <b>Kiro needs approval</b>\n\n<code>{cmd_text}</code>",
+            reply_markup={
+                "inline_keyboard": [[
+                    {"text": "✅ Run", "callback_data": "approve"},
+                    {"text": "❌ Reject", "callback_data": "reject"},
+                    {"text": "🔄 Trust", "callback_data": "trust"},
+                ]]
             }
-            return null;
-        }
-        // Found in main doc - get the LAST command (most recent/pending one)
-        const cmds = document.querySelectorAll('.agent-outcome-details pre');
-        const cmd = cmds.length > 0 ? cmds[cmds.length - 1] : null;
-        return cmd ? cmd.textContent : 'PENDING_NO_CMD';
-    })()
-    """
-
-    try:
-        result = asyncio.run(_cdp_eval(ws_url, js))
-        if result and result != "null" and result != last_notified_command:
-            last_notified_command = result
-            cmd_text = result if result != "PENDING_NO_CMD" else "(unknown command)"
-            send_message(
-                f"🔔 <b>Kiro needs approval</b>\n\n<code>{cmd_text}</code>",
-                reply_markup={
-                    "inline_keyboard": [
-                        [
-                            {"text": "✅ Run", "callback_data": "approve"},
-                            {"text": "❌ Reject", "callback_data": "reject"},
-                            {"text": "🔄 Trust", "callback_data": "trust"},
-                        ]
-                    ]
-                }
-            )
-        elif not result:
-            # No pending approval - reset tracker
-            last_notified_command = None
-    except Exception:
-        pass
-
-
-async def _cdp_eval(ws_url, js):
-    """Evaluate JS via CDP and return the result value."""
-    try:
-        import websockets
-    except ImportError:
-        import subprocess
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "websockets", "-q"])
-        import websockets
-
-    async with websockets.connect(ws_url) as ws:
-        msg = json.dumps({
-            "id": 99,
-            "method": "Runtime.evaluate",
-            "params": {"expression": js, "returnByValue": True}
-        })
-        await ws.send(msg)
-        resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=5))
-        return resp.get("result", {}).get("result", {}).get("value")
+        )
+    elif not result:
+        last_notified_command = None
 
 
 # === Main Loop ===
@@ -300,7 +172,7 @@ def poll_updates():
     global last_update_id
     result = telegram_api("getUpdates", {
         "offset": last_update_id + 1,
-        "timeout": 3,  # Short timeout so we can check for approvals frequently
+        "timeout": 3,
         "allowed_updates": ["message", "callback_query"],
     })
     if not result.get("ok"):
@@ -325,7 +197,7 @@ def main():
         print("ERROR: Set TELEGRAM_BOT_TOKEN")
         sys.exit(1)
     if not CHAT_ID:
-        print("ERROR: Set TELEGRAM_CHAT_ID (send /start to @userinfobot on Telegram)")
+        print("ERROR: Set TELEGRAM_CHAT_ID")
         sys.exit(1)
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -336,22 +208,21 @@ def main():
         print("ERROR: Invalid bot token")
         sys.exit(1)
 
-    print(f"[Bot] @{me['result']['username']} ready")
-    print(f"[Bot] Chat ID: {CHAT_ID}")
-    print(f"[Bot] CDP port: {CDP_PORT}")
+    print(f"[Telegram] @{me['result']['username']} ready")
+    print(f"[Telegram] Chat ID: {CHAT_ID}")
     send_message("🟢 <b>Bot started</b> — send /help")
 
     while running:
         try:
             poll_updates()
-            check_pending_approval()
+            poll_for_approvals()
         except KeyboardInterrupt:
             break
         except Exception as e:
-            print(f"[Bot] Error: {e}")
+            print(f"[Telegram] Error: {e}")
             time.sleep(5)
 
-    print("[Bot] Stopped.")
+    print("[Telegram] Stopped.")
 
 
 if __name__ == "__main__":
