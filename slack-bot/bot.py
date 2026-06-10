@@ -34,7 +34,10 @@ from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from core.config import SELECTORS
-from core.cdp import do_click, get_ws_url, check_pending_approval
+from core.cdp import (
+    do_click, get_ws_url, check_pending_approval,
+    send_message_to_agent, get_agent_output, is_agent_busy,
+)
 
 # === Configuration ===
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
@@ -209,14 +212,22 @@ def handle_trust(ack, body):
     )
 
 
+# === State for agent completion watcher ===
+waiting_for_agent = False
+agent_was_busy = False
+dm_channel_id = None  # Will be set in main()
+
+
 # === Also handle text replies in DM ===
 @app.event("message")
 def handle_message(event, say):
     """
     Handle incoming DM text messages.
     Reacts to y/n/t (case-insensitive).
-    Ignores everything else.
+    Any other text is sent directly to the agent chat.
     """
+    global waiting_for_agent, agent_was_busy
+
     # Only process messages from the target user
     user = event.get("user", "")
     if user != SLACK_USER_ID:
@@ -226,39 +237,100 @@ def handle_message(event, say):
     if event.get("bot_id") or event.get("subtype"):
         return
 
-    text = event.get("text", "").strip().lower()
+    text = event.get("text", "").strip()
+    text_lower = text.lower()
 
-    if text in ("y", "yes", "ok", "go", "run"):
+    if text_lower in ("y", "yes", "ok", "go", "run"):
         result = execute_approve()
         say(f"✅ {result}")
 
-    elif text in ("n", "no", "nope", "stop"):
+    elif text_lower in ("n", "no", "nope", "stop"):
         result = execute_reject()
         say(f"❌ {result}")
 
-    elif text in ("t", "trust", "always"):
+    elif text_lower in ("t", "trust", "always"):
         result = execute_trust()
         say(f"🔄 {result}")
 
-    elif text in ("status", "ping"):
+    elif text_lower in ("status", "ping"):
         ws = get_ws_url()
         if ws:
-            say("🟢 Kiro is connected")
+            busy = is_agent_busy()
+            status = "🟡 Agent is working..." if busy else "🟢 Agent idle"
+            say(f"🟢 Kiro is connected\n{status}")
         else:
-            say("🔴 Cannot reach Kiro")
+            say("🔴 Cannot reach Kiro — make sure it's running with `--remote-debugging-port=9229`")
 
-    elif text in ("help", "?"):
+    elif text_lower == "output":
+        output = get_agent_output(max_lines=15)
+        if output:
+            # Truncate if too long for Slack message
+            if len(output) > 2800:
+                output = output[-2800:]
+            say(f"🤖 *Last agent output:*\n```{output}```")
+        else:
+            say("⚠️ No agent output found")
+
+    elif text_lower in ("help", "?"):
         say(
             "🤖 *Kiro Remote Approve*\n\n"
-            "Commands: `y` `n` `t` `status` `help`\n"
-            "Or use the buttons when an approval appears."
+            "Commands:\n"
+            "• `y` / `yes` → Run (approve)\n"
+            "• `n` / `no` → Reject\n"
+            "• `t` / `trust` → Trust (always approve)\n"
+            "• `output` → Get last agent output\n"
+            "• `status` → Check Kiro connection\n"
+            "• `help` → Show this message\n\n"
+            "Any other text → sent directly to agent chat"
         )
 
-    # Ignore any other messages
+    else:
+        # Send any other text directly to the agent
+        result = send_message_to_agent(text)
+        say(f"📨 {result}")
+        if "Sent" in result:
+            waiting_for_agent = True
+            agent_was_busy = False
+
+
+# === Agent Completion Watcher ===
+def poll_agent_completion():
+    """Watch for agent to finish after we sent a message."""
+    global waiting_for_agent, agent_was_busy, dm_channel_id
+
+    if not waiting_for_agent:
+        return
+
+    busy = is_agent_busy()
+
+    if busy:
+        agent_was_busy = True
+    elif agent_was_busy and not busy:
+        # Agent was busy and now stopped — it finished
+        waiting_for_agent = False
+        agent_was_busy = False
+        # Give it a moment for final render
+        import time
+        time.sleep(1)
+        output = get_agent_output(max_lines=15)
+        if output:
+            if len(output) > 2800:
+                output = output[-2800:]
+            app.client.chat_postMessage(
+                channel=dm_channel_id,
+                text=f"✅ *Agent finished:*\n```{output}```",
+            )
+        else:
+            app.client.chat_postMessage(
+                channel=dm_channel_id,
+                text="✅ Agent finished (no output captured)",
+            )
 
 
 # === Main ===
 def main():
+    global dm_channel_id
+
     print("[Slack] Starting Socket Mode bot...")
 
     # Open DM channel for later use
@@ -267,12 +339,12 @@ def main():
         print(f"ERROR: Could not open DM — {result.get('error')}")
         sys.exit(1)
 
-    dm_channel = result["channel"]["id"]
+    dm_channel_id = result["channel"]["id"]
 
     # Send a simple welcome message
     app.client.chat_postMessage(
-        channel=dm_channel,
-        text="🟢 Kiro Remote Approve bot started — waiting for pending approvals.",
+        channel=dm_channel_id,
+        text="🟢 Kiro Remote Approve bot started — send `help` for commands.",
     )
 
     # Start Socket Mode handler in a background thread
@@ -293,6 +365,7 @@ def main():
                 send_approval_request(cmd_text)
             elif not pending:
                 last_notified_command = None
+            poll_agent_completion()
             time.sleep(3)
         except KeyboardInterrupt:
             print("[Slack] Shutting down.")
